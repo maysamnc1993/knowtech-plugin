@@ -224,10 +224,17 @@ class KT_WooCommerce {
             $product_id = $item->get_product_id();
             $variation_id = $item->get_variation_id();
 
-            // Check for variation first, then product
-            $check_id = $variation_id ? $variation_id : $product_id;
+            // Check variation first, then parent product for subscription settings
+            // Meta is usually stored on parent product, not variation
+            $check_id = $product_id; // Always check parent product first
 
             $is_subscription = get_post_meta($check_id, '_kt_is_subscription', true);
+
+            // If not found on parent and this is a variation, check variation too
+            if ($is_subscription !== '1' && $variation_id) {
+                $check_id = $variation_id;
+                $is_subscription = get_post_meta($check_id, '_kt_is_subscription', true);
+            }
 
             if ($is_subscription !== '1') {
                 continue;
