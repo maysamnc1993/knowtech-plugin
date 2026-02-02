@@ -29,8 +29,8 @@ class KT_WooCommerce {
         add_action('woocommerce_process_product_meta', array($this, 'save_product_meta'));
         
         // Order completed hook
-        add_action('woocommerce_order_status_completed', array($this, 'create_subscription_on_order'));
-        add_action('woocommerce_order_status_processing', array($this, 'create_subscription_on_order'));
+        add_action('woocommerce_order_status_completed', array($this, 'auto_create_subscription_on_order'));
+        add_action('woocommerce_order_status_processing', array($this, 'auto_create_subscription_on_order'));
         
         // Add subscription fields to order
         add_action('woocommerce_admin_order_data_after_billing_address', array($this, 'display_subscription_info'));
@@ -188,46 +188,63 @@ class KT_WooCommerce {
     }
     
     /**
-     * Create subscription when order is completed
+     * Auto create subscription (wrapper for hooks)
      */
-    public function create_subscription_on_order($order_id) {
+    public function auto_create_subscription_on_order($order_id) {
+        $this->create_subscription_on_order($order_id, false);
+    }
+
+    /**
+     * Create subscription when order is completed
+     * @return array Result with success status and message
+     */
+    public function create_subscription_on_order($order_id, $manual = false) {
         $order = wc_get_order($order_id);
-        
+
         if (!$order) {
-            return;
+            return array('success' => false, 'message' => 'سفارش یافت نشد');
         }
-        
+
         $user_id = $order->get_user_id();
-        
+
         if (!$user_id) {
-            return;
+            return array('success' => false, 'message' => 'این سفارش کاربر ثبت‌نام شده ندارد (سفارش مهمان)');
         }
-        
+
         // Check if subscription already created
         $subscription_created = get_post_meta($order_id, '_kt_subscription_created', true);
-        if ($subscription_created) {
-            return;
+        if ($subscription_created && !$manual) {
+            return array('success' => false, 'message' => 'اشتراک قبلاً برای این سفارش ساخته شده است');
         }
-        
+
+        $created_count = 0;
+        $errors = array();
+
         foreach ($order->get_items() as $item_id => $item) {
             $product_id = $item->get_product_id();
             $variation_id = $item->get_variation_id();
-            
+
             // Check for variation first, then product
             $check_id = $variation_id ? $variation_id : $product_id;
-            
+
             $is_subscription = get_post_meta($check_id, '_kt_is_subscription', true);
-            
+
             if ($is_subscription !== '1') {
                 continue;
             }
-            
+
             $kt_product_id = get_post_meta($check_id, '_kt_product_id', true);
             $duration_months = get_post_meta($check_id, '_kt_duration_months', true);
             $credentials_required = get_post_meta($check_id, '_kt_credentials_required', true);
             $use_account_pool = get_post_meta($check_id, '_kt_use_account_pool', true);
-            
-            if (empty($kt_product_id) || empty($duration_months)) {
+
+            if (empty($kt_product_id)) {
+                $errors[] = 'محصول "' . $item->get_name() . '": سرویس KnowTech انتخاب نشده';
+                continue;
+            }
+
+            if (empty($duration_months)) {
+                $errors[] = 'محصول "' . $item->get_name() . '": مدت اشتراک تنظیم نشده';
                 continue;
             }
             
@@ -268,21 +285,36 @@ class KT_WooCommerce {
                 
                 // Store subscription ID in order meta
                 add_post_meta($order_id, '_kt_subscription_id', $sub_id);
-                
+
                 // Add order note
                 $product = KT_Products::instance()->get_product($kt_product_id);
                 $order->add_order_note(
-                    sprintf('اشتراک %s به مدت %d ماه برای کاربر ایجاد شد (ID: %d)', 
-                        $product->name, 
-                        $duration_months, 
+                    sprintf('اشتراک %s به مدت %d ماه برای کاربر ایجاد شد (ID: %d)',
+                        $product->name,
+                        $duration_months,
                         $sub_id
                     )
                 );
+
+                $created_count++;
+            } else {
+                $errors[] = 'محصول "' . $item->get_name() . '": خطا در ایجاد اشتراک در دیتابیس';
             }
         }
-        
+
+        // Check if any subscription products found
+        if ($created_count === 0 && empty($errors)) {
+            return array('success' => false, 'message' => 'هیچ محصول اشتراکی KnowTech در این سفارش یافت نشد. ابتدا محصول را به عنوان اشتراک KnowTech تنظیم کنید.');
+        }
+
+        if ($created_count === 0 && !empty($errors)) {
+            return array('success' => false, 'message' => implode("\n", $errors));
+        }
+
         // Mark as created
         update_post_meta($order_id, '_kt_subscription_created', '1');
+
+        return array('success' => true, 'message' => sprintf('%d اشتراک با موفقیت ایجاد شد', $created_count), 'count' => $created_count);
     }
     
     /**
@@ -356,22 +388,35 @@ class KT_WooCommerce {
      */
     public function process_order_action_create_subscription($order) {
         $order_id = $order->get_id();
-        
+
         // Remove the flag if exists to allow recreation
         delete_post_meta($order_id, '_kt_subscription_created');
-        
+
         // Run the subscription creation
-        $this->create_subscription_on_order($order_id);
-        
-        // Add order note
-        $order->add_order_note('✅ اشتراک به صورت دستی ساخته شد توسط Admin', false, true);
-        
-        // Display admin notice
-        add_action('admin_notices', function() use ($order_id) {
-            echo '<div class="notice notice-success is-dismissible">';
-            echo '<p><strong>موفق!</strong> اشتراک برای سفارش #' . $order_id . ' ساخته شد.</p>';
-            echo '</div>';
-        });
+        $result = $this->create_subscription_on_order($order_id, true);
+
+        if ($result['success']) {
+            // Add order note
+            $order->add_order_note('✅ ' . $result['message'] . ' (توسط Admin)', false, true);
+
+            // Display admin notice
+            add_action('admin_notices', function() use ($order_id, $result) {
+                echo '<div class="notice notice-success is-dismissible">';
+                echo '<p><strong>موفق!</strong> ' . esc_html($result['message']) . ' برای سفارش #' . $order_id . '</p>';
+                echo '</div>';
+            });
+        } else {
+            // Add error note
+            $order->add_order_note('❌ خطا در ساخت اشتراک: ' . $result['message'], false, true);
+
+            // Display error notice
+            add_action('admin_notices', function() use ($order_id, $result) {
+                echo '<div class="notice notice-error is-dismissible">';
+                echo '<p><strong>خطا!</strong> ' . esc_html($result['message']) . '</p>';
+                echo '<p>سفارش #' . $order_id . '</p>';
+                echo '</div>';
+            });
+        }
     }
     
     /**
